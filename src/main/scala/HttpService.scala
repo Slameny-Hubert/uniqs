@@ -1,83 +1,62 @@
 import akka.actor.{ActorRef, ActorSystem}
-import akka.event.{Logging, LoggingAdapter}
 import akka.http.scaladsl.Http
-import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
+import akka.http.scaladsl.model.{ContentTypes, HttpEntity, StatusCodes}
 import akka.http.scaladsl.server.Directives._
 import akka.http.scaladsl.server.Route
-import akka.pattern.ask
-import akka.stream.{ActorMaterializer, Materializer}
-import akka.util.Timeout
+import com.redis.RedisClient
 import com.typesafe.config.{Config, ConfigFactory}
-import model.ImdbHandler
-import spray.json.DefaultJsonProtocol
 
 import scala.concurrent.ExecutionContextExecutor
-import rule.RuleFactory
 
-case class UserPwd(pwd:String)
-
-case class UpsertRequest(username:String, password:String )
-
-
-trait Protocols extends DefaultJsonProtocol {
-  implicit val nameFormat = jsonFormat4(response.NameResponse.apply)
-  implicit val movieFormat = jsonFormat9(response.MovieResponse.apply)
-  implicit val topFormat = jsonFormat2(response.TopResponse.apply)
-}
-
-trait Service extends Protocols {
-  import scala.concurrent.duration._
-
+trait Service {
+  import Accumulator._
   implicit val system: ActorSystem
   implicit def executor: ExecutionContextExecutor
-  implicit val materializer: Materializer
   implicit def config: Config
-  val logger: LoggingAdapter
-  def imdbHandler: ActorRef
-  implicit def requestTimeout = Timeout(5 seconds)
+  val accumulator: ActorRef
+  val redis: RedisClient
 
-  val routes: Route = {
-  pathPrefix("api") {
-    pathPrefix("movie") {
-      path(Segment) { title => {
-        complete((imdbHandler ? ImdbHandler.GetMovie(title)).mapTo[Seq[response.MovieResponse]])
-      }}
-    } ~
-      pathPrefix("name") {
-        path(Segment) { name => {
-          complete((imdbHandler ? ImdbHandler.GetName(name)).mapTo[Seq[response.NameResponse]])
-        }}
-      } ~
-      pathPrefix("top") {
-        pathPrefix(Segment) { genre => {
-          parameters('qnt.as[Int], 'off.as[Int]) { (qnt, off) =>
-            validate(qnt > 0, "Wrong quantity. qnt must be positive.") {
-              validate(off >= 0, "Wrong offset. off must be non negative") {
-                rejectEmptyResponse {
-                  complete((imdbHandler ? ImdbHandler.GetTop(genre, qnt, off)).mapTo[Option[Seq[response.TopResponse]]])
-                }
-              }
-            }
+  def getStat(ts: Long) = {
+    val hs = ts / (60 * 60 * 1000)
+    val uniqs = redis.get(s"uniqs:$hs").map(_.toInt).getOrElse(0)
+    val clicks = redis.get(s"clicks:$hs").map(_.toInt).getOrElse(0)
+    val impressions = redis.get(s"impressions:$hs").map(_.toInt).getOrElse(0)
+    (uniqs, clicks, impressions)
+  }
+
+  val route: Route = {
+    path("analytics") {
+      post {
+        parameters('timestamp.as[Long], 'user.as[String], 'click.as[String]) { (ts, user, _) =>
+          accumulator ! Event(user, ts, Click)
+          complete(StatusCodes.OK)
+        } ~
+          parameters('timestamp.as[Long], 'user.as[String], 'impression.as[String]) { (ts, user, _) =>
+            accumulator ! Event(user, ts, Impression)
+            complete(StatusCodes.OK)
           }
-        }}
       } ~
-      pathPrefix("together") {
-        parameters('name, 'name.*) { (name, names) =>
-          complete((imdbHandler ? ImdbHandler.GetTogether(names.toSet + name)).mapTo[Seq[response.MovieResponse]])
+        get {
+          parameters('timestamp.as[Long]) { ts =>
+            val (uniqs, clicks, impressions) = getStat(ts)
+            complete(HttpEntity(
+              ContentTypes.`text/plain(UTF-8)`,
+              s"unique_users,$uniqs\nclicks,$clicks\nimpressions,$impressions"
+            ))
+          }
         }
-      }
     }
   }
 }
 
 object HttpService extends App with Service {
-  override implicit val system = ActorSystem()
+  override implicit val system = ActorSystem("uniqs")
   override implicit val executor = system.dispatcher
-  override implicit val materializer = ActorMaterializer()
   override val config = ConfigFactory.load()
-  override val logger = Logging(system, getClass)
-  val ruleFactory = new RuleFactory(config)
-  val imdbHandler = system.actorOf(ImdbHandler.props(ruleFactory))
+  val redisConf = config.getConfig("redis")
+  override val redis = new RedisClient(redisConf.getString("host"), redisConf.getInt("port"))
+  override val accumulator = system.actorOf(Accumulator.props(config.getConfig("accumulator"), redis))
+  val bindingFuture = Http().bindAndHandle(route, config.getString("http.interface"), config.getInt("http.port"))
 
-  Http().bindAndHandle(routes, config.getString("http.interface"), config.getInt("http.port"))
+  println(s"Server online at http://${config.getString("http.interface")}:${config.getInt("http.port")}/analytics")
 }

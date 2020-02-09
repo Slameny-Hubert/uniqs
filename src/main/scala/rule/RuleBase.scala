@@ -1,5 +1,0 @@
-package rule
-
-trait RuleBase {
-
-}
